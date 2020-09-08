@@ -1,0 +1,318 @@
+---
+title: "Quantitative RNAseq"
+author: "Cenk Celik"
+date: "08/09/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+To perform a quantitative RNAseq analysis, I will be using the following packages to be able to answer which transcripts are differentially expressed:
+
+- _edgeR_ and _DESeq2_ for estimating differential expression
+- _GRanges_ to find unannotated transcribed regions
+- _bumphunter_ for finding regions with high expression
+- differential peak analysis
+- _SVA_ for estimating batch effects
+- _AllelicImbalance_ for finding allele-specific expression
+- plots and RNAseq data presentation
+
+Below are the packages that I will need:
+
+- _AllelicImbalance, bumphunter, csaw, DESeq, edgeR, IRanges, Rsamtools, rtracklayer, sva, SummarizedExperiment, VariantAnnotation_ from _Bioconductor_
+- dplyr
+- extRemes
+- forcats
+- magrittr
+- readr
+
+# Estimating Differential Expression with _edgeR_
+
+```{r message=FALSE, warning=FALSE}
+# load packages
+library(edgeR)
+library(readr)
+library(magrittr)
+library(Biobase)
+```
+
+## Using _edgeR_ from a count table
+
+```{r}
+# load the count data from a TXT file
+count_dataframe <- read_tsv( "modencodefly_count_table.txt")
+genes <- count_dataframe[["gene"]]
+count_dataframe[["gene"]] <- NULL
+count_matrix <- as.matrix(count_dataframe)
+rownames(count_matrix) <- genes
+# load the phenotype data
+pheno_data <- read_table2("modencodefly_phenodata.txt")
+```
+
+```{r}
+# specify experiments of interest
+experiments_of_interest <- c("L1Larvae", "L2Larvae")
+columns_of_interest <- which(pheno_data$stage %in% experiments_of_interest)
+```
+
+```{r}
+# form the grouping factor
+library(forcats)
+grouping <- pheno_data$stage[columns_of_interest] %>% as_factor()
+```
+
+```{r}
+# form the subset of count data
+counts_of_interest <- count_matrix[, columns_of_interest]
+```
+
+```{r}
+# create the DGE object
+count_dge <- DGEList(counts = counts_of_interest, group = grouping)
+```
+
+Now, I will perform differential expression analysis:
+
+```{r}
+# differential expression analysis
+design <- model.matrix(~ grouping)
+eset_dge <- estimateDisp(count_dge, design)
+# model fit
+fit <- glmQLFit(eset_dge, design)
+result <- glmQLFTest(fit, coef = 2)
+topTags(result)
+```
+## Using _edgeR_ from an _ExpressionSet_ object
+
+```{r message=FALSE, warning=FALSE}
+# load data
+load("modencodefly_eset.RData")
+```
+
+```{r}
+# specify the experiments of interest
+experiments_of_interest <- c("L1Larvae", "L2Larvae")
+columns_of_interest <- which(pheno_data$stage %in% experiments_of_interest)
+```
+
+```{r}
+# form the grouping factor
+grouping <- droplevels(phenoData(modencodefly.eset)[["stage"]][columns_of_interest])
+```
+
+```{r}
+# form the subset of count data
+counts_of_interest <- exprs(modencodefly.eset)[, columns_of_interest]
+```
+
+```{r}
+# create the DGE object
+eset_dge <- DGEList(counts = counts_of_interest, group = grouping)
+```
+
+```{r}
+# perform differential expression analysis
+design <- model.matrix(~ grouping)
+eset_dge <- estimateDisp(count_dge, design)
+
+# model fit
+fit <- glmQLFit(eset_dge, design)
+result <- glmQLFTest(fit, coef = 2)
+topTags(result)
+```
+
+# Estimating Differential Expression with _DESeq2_
+
+This package uses dispersion estimates and relative expression changes to strengthen estimates and modeling with an emphasis on improving gene ranking in result tables. Contrary to _edgeR_, _DESeq2_ uses a geometric style normalisation in which the per lane scaling factor is computed as the median of the ratios of the gene count over its geometric mean ration, whereas _edgeR_ uses the weighted one.
+
+```{r}
+# load packages
+library(readr)
+library(magrittr)
+library(SummarizedExperiment)
+library(DESeq2)
+```
+
+## Using _DESeq2_ from an _ExpressionSet_ object
+
+```{r}
+# load data
+load("modencodefly_eset.RData")
+
+# convert into DESeqDataSet
+summ_exp <- makeSummarizedExperimentFromExpressionSet(modencodefly.eset)
+ddsSE <- DESeqDataSet(summ_exp, design = ~ stage)
+```
+
+```{r}
+ddsSE <- DESeq(ddsSE)
+resSE <- results(ddsSE, contrast = c("stage", "L2Larvae", "L1Larvae"))
+```
+
+# Differential Peak Analysis
+
+When unannotated transcript are discovered, I will check whether they are differentially expressed between experiments.
+
+```{r}
+# load packages
+library(SummarizedExperiment)
+```
+
+```{r}
+# load data
+arab_rse <- readRDS("arabidopsis_rse.RDS")
+
+# set up a function to create region tags
+make_tag <- function(grange_obj){
+  paste0(
+    grange_obj@seqnames,
+    ":",
+    grange_obj@ranges@start,
+    "-",
+    (grange_obj@ranges@start + grange_obj@ranges@width)
+  )
+}
+```
+
+Pull out the actual data from _RangedSummarizedExperiment_ using the _assay()_ function.
+
+```{r}
+# extract data
+counts <- assay(arab_rse)
+
+# annotate rows
+if (! is.null(names(rowRanges(arab_rse)))){
+  rownames(counts) <- names(rowRanges(arab_rse))
+} else {
+  rownames(counts) <- make_tag(rowRanges(arab_rse))
+}
+```
+
+# Estimating Batch Effects using _SVA_
+
+High-throughput data like RNA-seq is often fashioned by technical errors that are not explicitly modelled in the experimental design, therefore, confound the detection of differential expression. This technical error should be modelled in the experimental design. For this reason, _surrogate variable_ tables are used to explain the batch effects and take it into account in the modelling and differential expression analysis.
+
+```{r}
+# load packages
+library(sva)
+
+# data
+arab <- readRDS("arabidopsis.RDS")
+```
+
+```{r}
+# filter out rows with too few counts
+keep <- apply(arab, 1, function(x){length(x[x > 3]) >= 2})
+arab_filtered <- arab[keep, ]
+```
+
+```{r}
+# create the initial design
+groups <- as.factor(rep(c("mock", "hrcc"), each = 3))
+```
+
+```{r}
+# set up the null and alternative hypothesis
+test_model <- model.matrix(~groups)
+null_model <- test_model[, 1]
+
+# run SVA
+svar <- svaseq(arab_filtered,
+               test_model,
+               null_model,
+               n.sv = 1)
+```
+
+```{r}
+# extract SVA
+design <- cbind(test_model, svar$sv)
+```
+
+# Finding Allele-specific Expressions with AllelicImbalance
+
+When there is a differential abundance of different allelic variants of a transcript, it is called an allele-specific expression. By using RNA-seq data, one would be able to estimate allele-specific expression for genes with polymorphisms.
+
+```{r}
+# load packages
+library(AllelicImbalance)
+library(VariantAnnotation)
+```
+
+```{r}
+# create a GRanges object
+region_of_interest <- GRanges(seqnames = c("17"), ranges = IRanges(79478301, 79478361))
+
+# set up an import folder
+bam_folder <- "allele_expression"
+
+# load reads and variants in regions of interests
+reads <- impBamGAL(bam_folder, region_of_interest, verbose = FALSE)
+
+vcf_file <- "allele_expression/ERP000101.vcf"
+variant_positions <- granges(VariantAnnotation::readVcf(vcf_file), "hg19")
+
+allele_counts <- getAlleleCounts(reads, variant_positions, verbose = FALSE)
+```
+
+```{r}
+# build the ASEset object
+ase.vcf <- ASEsetFromCountList(rowRanges = variant_positions, allele_counts)
+reference_sequence <- "allele_expression/hg19.chr17.subset.fa"
+ref(ase.vcf) <- refAllele(ase.vcf, fasta = reference_sequence) # reference base identity
+alt(ase.vcf) <- inferAltAllele(ase.vcf) # alternative base identity
+```
+
+```{r}
+# run the test on all variants
+binom.test(ase.vcf, n = "*")
+```
+
+# Plotting and Presenting RNA-seq Data
+
+```{r}
+# load packages
+library(DESeq2)
+library(ggplot2)
+library(magrittr)
+library(dplyr)
+```
+
+```{r}
+# create dataframe
+dds <- readRDS("modencode_dds.RDS")
+```
+
+```{r}
+# create a boxplot of counts for a single gene
+plotCounts(dds,
+           gene = "FBgn0000014",
+           intgroup = "stage",
+           returnData = TRUE) %>%
+  ggplot() + aes(stage, count) + geom_boxplot(aes(fill = stage)) +
+  scale_y_log10() + theme_bw()
+```
+
+```{r}
+# create an MA plot with colouring conditioned on significance
+result_df <- results(dds, contrast = c("stage", "L2Larvae", "L1Larvae"), tidy = TRUE) %>%
+  mutate(is_significant = padj < 0.05)
+
+ggplot(result_df) + aes(baseMean, log2FoldChange) +
+  geom_point(aes(colour = is_significant)) +
+  scale_x_log10() +
+  theme_bw()
+```
+
+```{r}
+# create a volcano plot with colouring conditioned on significance
+ggplot(result_df) +
+  aes(log2FoldChange, -1 * log10(pvalue)) +
+  geom_point(aes(colour=is_significant)) +
+  theme_bw()
+```
+
+```{r session info}
+sessionInfo()
+```
